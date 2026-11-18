@@ -12,6 +12,7 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 
 from .articles_data import ARTICLES
+from .outline_matcher import split_sentences
 
 
 class ArticleTfidfModel:
@@ -29,14 +30,41 @@ class ArticleTfidfModel:
             norm="l2",
         )
         bodies = [a["body"] for a in ARTICLES]
-        # 仅用文章拟合（fit），兴趣文本之后只能 transform。
+        # 仅用文章拟合（fit），兴趣/提纲文本之后只能 transform。
         self.article_matrix = self.vectorizer.fit_transform(bodies)
         self.article_ids = [a["id"] for a in ARTICLES]
         self.feature_count = len(self.vectorizer.vocabulary_)
 
+        # 把 30 篇正文按 。！？ 切成句子，并在同一（文章拟合出的）特征空间内
+        # 只做 transform，绝不重新 fit。每条记录关联其来源文章 id。
+        self.sentence_records: list[dict] = []
+        for a in ARTICLES:
+            for idx, sentence in enumerate(split_sentences(a["body"])):
+                self.sentence_records.append(
+                    {"article_id": a["id"], "sentence_index": idx, "text": sentence}
+                )
+        self.sentence_matrix = self.vectorizer.transform(
+            [r["text"] for r in self.sentence_records]
+        )
+
     def transform_interest(self, text: str):
         """把兴趣短文变换到文章拟合出的 TF-IDF 空间（不重新拟合）。"""
         return self.vectorizer.transform([text or ""])
+
+    def transform_texts(self, texts: list[str]):
+        """把若干短句变换到文章拟合出的 TF-IDF 空间（不重新拟合）。"""
+        return self.vectorizer.transform([t or "" for t in texts])
+
+    def cosine_against_sentences(self, query_matrix) -> list[list[float]]:
+        """查询矩阵（多行短句）与全部正文句子的余弦相似度。
+
+        返回 rows × 句子数 的二维列表，元素截断到 [0, 1]。
+        """
+        sims = cosine_similarity(query_matrix, self.sentence_matrix)
+        return [
+            [float(max(0.0, min(1.0, v))) for v in row]
+            for row in sims
+        ]
 
     def relevance_vector(self, interest_text: str) -> dict[int, float]:
         """返回 {文章id: 余弦相关度}，相关度截断到 [0, 1]。"""

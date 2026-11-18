@@ -13,6 +13,7 @@ import time
 
 from . import database
 from .optimizer import solve_queue
+from .outline_matcher import match_outline
 from .tfidf_model import get_model
 
 log = logging.getLogger("recommender.worker")
@@ -50,17 +51,25 @@ class ComputeWorker:
         # 模型在后台线程首次构建，避免拖累启动；get_model 内部有锁。
         while not self._stop.is_set():
             try:
+                # 阅读推荐任务优先；空闲时处理提纲核查任务
                 job = database.claim_pending_job()
+                if job is None:
+                    job_outline = database.claim_pending_outline_job()
+                else:
+                    job_outline = None
             except Exception:  # pragma: no cover - 数据库临时故障重试
                 log.exception("领取任务失败，稍后重试")
                 time.sleep(0.5)
                 continue
-            if job is None:
+            if job is None and job_outline is None:
                 self._stop.wait(0.25)
                 continue
             self._busy.set()
             try:
-                self._process(job)
+                if job is not None:
+                    self._process(job)
+                else:
+                    self._process_outline(job_outline)
             finally:
                 self._busy.clear()
 
@@ -106,6 +115,55 @@ class ComputeWorker:
                 database.fail_job(generation, f"{type(exc).__name__}: {exc}")
             except Exception:  # pragma: no cover
                 log.exception("写入失败状态时出错")
+
+    def _process_outline(self, job: dict) -> None:
+        """处理一次提纲素材核查；迟到的旧核查结果不得覆盖新核查。"""
+        check_id = job["check_id"]
+        snapshot = job["request_snapshot"]
+        delay = max(0, int(snapshot.get("compute_delay_ms", 0))) / 1000.0
+        try:
+            # 慢核查窗口：此期间编辑可修改提纲并提交新核查，本任务随后会变 stale。
+            deadline = time.monotonic() + delay
+            while time.monotonic() < deadline:
+                if self._stop.is_set():
+                    return
+                time.sleep(min(0.1, deadline - time.monotonic()))
+
+            model = get_model()
+            points = snapshot["points"]
+            query_matrix = model.transform_texts([p["text"] for p in points])
+            sim_rows = model.cosine_against_sentences(query_matrix)
+            sentence_similarities = [
+                [
+                    {
+                        "article_id": rec["article_id"],
+                        "sentence_index": rec["sentence_index"],
+                        "text": rec["text"],
+                        "score": score,
+                    }
+                    for rec, score in zip(model.sentence_records, row)
+                ]
+                for row in sim_rows
+            ]
+            result = match_outline(points, sentence_similarities)
+            payload = {
+                "check_id": check_id,
+                "matched_count": result.matched_count,
+                "point_count": result.point_count,
+                "total_score": result.total_score,
+                "results": [r.__dict__ for r in result.results],
+            }
+            accepted = database.complete_outline_job(check_id, payload)
+            if not accepted:
+                log.info("提纲核查 %s 的迟到结果已被丢弃", check_id)
+        except Exception as exc:
+            log.exception("提纲核查 %s 失败", check_id)
+            try:
+                database.fail_outline_job(
+                    check_id, f"{type(exc).__name__}: {exc}"
+                )
+            except Exception:  # pragma: no cover
+                log.exception("写入提纲核查失败状态时出错")
 
 
 _worker = ComputeWorker()

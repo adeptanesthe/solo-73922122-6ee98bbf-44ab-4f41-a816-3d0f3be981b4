@@ -2,7 +2,14 @@
 "use strict";
 
 const $ = (sel) => document.querySelector(sel);
-const state = { data: null, pollTimer: null };
+const state = {
+  data: null,
+  pollTimer: null,
+  outline: { rows: [], token: null, timer: null, lastRendered: null },
+};
+const OUTLINE_MIN = 3;
+const OUTLINE_MAX = 6;
+const DEFAULT_THRESHOLD = 0.2;
 
 async function api(path, options = {}) {
   const resp = await fetch(path, {
@@ -211,6 +218,16 @@ async function refresh() {
   renderQuotas();
   renderQueue();
   schedulePoll();
+  // 首次加载时恢复最近一次核查结果；页面内提交后的状态由令牌逻辑自行管理
+  if (state.outline.token === null && state.data.outline_job) {
+    const job = state.data.outline_job;
+    state.outline.token = job.check_id;
+    state.outline.lastRendered = job.check_id;
+    renderOutlineResults(job);
+    if (job.status === "pending" || job.status === "running") {
+      scheduleOutlinePoll();
+    }
+  }
 }
 
 function schedulePoll() {
@@ -297,6 +314,211 @@ async function resetDemo() {
   renderQuotas();
   renderQueue();
   schedulePoll();
+  // 重置同时清空提纲核查的本地状态，旧核查结果不再展示
+  state.outline.token = null;
+  state.outline.lastRendered = null;
+  clearTimeout(state.outline.timer);
+  renderOutlineResults(null);
+  $("#outline-status").style.display = "none";
+  $("#outline-msg").textContent = "";
+}
+
+/* ---------------- 提纲素材核查 ---------------- */
+
+function renderOutlinePoints() {
+  const wrap = $("#outline-points");
+  wrap.innerHTML = "";
+  state.outline.rows.forEach((row, i) => {
+    const div = document.createElement("div");
+    div.className = "outline-point";
+    div.innerHTML = `
+      <span class="idx">${i + 1}</span>
+      <textarea rows="2" placeholder="提纲点 ${i + 1} 的短句……"></textarea>
+      <div class="threshold-box">
+        <label>相似度下限（0.05~0.95）</label>
+        <input type="number" min="0.05" max="0.95" step="0.01" />
+      </div>
+      <button class="btn-remove" title="删除该提纲点">×</button>`;
+    const [textarea, thresholdInput, removeBtn] =
+      [div.querySelector("textarea"), div.querySelector("input[type=number]"), div.querySelector(".btn-remove")];
+    textarea.value = row.text;
+    thresholdInput.value = row.threshold;
+    textarea.addEventListener("input", () => { state.outline.rows[i].text = textarea.value; });
+    thresholdInput.addEventListener("input", () => {
+      state.outline.rows[i].threshold = thresholdInput.value;
+    });
+    removeBtn.disabled = state.outline.rows.length <= OUTLINE_MIN;
+    removeBtn.addEventListener("click", () => {
+      if (state.outline.rows.length <= OUTLINE_MIN) return;
+      state.outline.rows.splice(i, 1);
+      renderOutlinePoints();
+    });
+    wrap.appendChild(div);
+  });
+  $("#btn-outline-add").disabled = state.outline.rows.length >= OUTLINE_MAX;
+}
+
+function addOutlinePoint() {
+  if (state.outline.rows.length >= OUTLINE_MAX) return;
+  state.outline.rows.push({ text: "", threshold: DEFAULT_THRESHOLD });
+  renderOutlinePoints();
+}
+
+function readOutlinePoints() {
+  const points = [];
+  document.querySelectorAll("#outline-points .outline-point").forEach((el, i) => {
+    const text = el.querySelector("textarea").value.trim();
+    const raw = el.querySelector("input[type=number]").value;
+    const threshold = parseFloat(raw);
+    if (!text) throw new Error(`第 ${i + 1} 个提纲点短句不能为空`);
+    if (text.length > 500) throw new Error(`第 ${i + 1} 个提纲点过长（上限 500 字）`);
+    if (!(threshold >= 0.05 && threshold <= 0.95)) {
+      throw new Error(`第 ${i + 1} 个提纲点的相似度下限必须在 0.05~0.95 之间`);
+    }
+    points.push({ text, threshold });
+  });
+  if (points.length < OUTLINE_MIN || points.length > OUTLINE_MAX) {
+    throw new Error("提纲点数量必须在 3~6 个之间");
+  }
+  return points;
+}
+
+function renderOutlineResults(job) {
+  const box = $("#outline-results");
+  const statusEl = $("#outline-status");
+  box.innerHTML = "";
+  if (!job) {
+    statusEl.style.display = "none";
+    return;
+  }
+  const labelMap = {
+    pending: "等待核查",
+    running: "正在核查（慢核查期间可修改提纲重新提交，迟到结果不会覆盖新核查）",
+    done: "核查完成",
+    failed: `核查失败：${job.error || "未知错误"}`,
+    stale: "该核查已过期（提纲已更新，结果作废）",
+  };
+  statusEl.style.display = "block";
+  statusEl.className = `job-status ${job.status === "failed" ? "failed" : job.status === "done" ? "done" : "pending"}`;
+  statusEl.textContent = `核查 #${job.check_id} · ${labelMap[job.status] || job.status}`;
+
+  if (job.status !== "done" || !job.result) {
+    if (job.status === "stale") {
+      box.innerHTML = `<div class="msg">本次核查已被更新的提纲取代，未展示任何旧结果。</div>`;
+    }
+    return;
+  }
+
+  const result = job.result;
+  result.results.forEach((r) => {
+    const card = document.createElement("div");
+    card.className = `outline-card ${r.assigned ? "assigned" : "unassigned"}`;
+    const badge = r.assigned
+      ? `<span class="oc-badge ok">已找到来源</span>`
+      : `<span class="oc-badge todo">待补材料</span>`;
+    let inner = `
+      <div class="oc-head">
+        <div class="oc-point">${r.index + 1}. ${escapeHtml(r.text)}</div>
+        ${badge}
+      </div>
+      <div class="oc-meta">
+        <span class="tag">下限 ${Number(r.threshold).toFixed(2)}</span>
+      </div>`;
+    if (r.assigned) {
+      inner += `
+        <div class="oc-meta">
+          <span class="tag">${escapeHtml(r.topic)}</span>
+          <span class="tag author">${escapeHtml(r.author)}</span>
+          <span>#${r.article_id} ${escapeHtml(r.article_title)}</span>
+        </div>
+        <div class="oc-sentence">${escapeHtml(r.sentence)}</div>
+        <div class="oc-score">句子相似度：<b>${Number(r.score).toFixed(4)}</b></div>`;
+    } else {
+      inner += `<div class="oc-hint">没有文章句子达到该点下限，需补充稿件材料。</div>`;
+      if (r.best_unsatisfied) {
+        const b = r.best_unsatisfied;
+        inner += `
+          <div class="oc-hint">
+            全库最接近：#${b.article_id}《${escapeHtml(b.article_title)}》
+            （相似度 ${Number(b.score).toFixed(4)}，低于下限 ${Number(r.threshold).toFixed(2)}）<br/>
+            原句：${escapeHtml(b.sentence)}
+          </div>`;
+      }
+    }
+    card.innerHTML = inner;
+    box.appendChild(card);
+  });
+
+  const summary = document.createElement("div");
+  summary.className = "outline-summary";
+  summary.innerHTML =
+    `达标点 <b>${result.matched_count}</b> / ${result.point_count} 个 · ` +
+    `所选句子总相似度 <b>${Number(result.total_score).toFixed(4)}</b> · ` +
+    `每篇文章至多分配给一个点`;
+  box.appendChild(summary);
+}
+
+function escapeHtml(s) {
+  return String(s ?? "").replace(/[&<>"']/g, (ch) => ({
+    "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
+  }[ch]));
+}
+
+function scheduleOutlinePoll() {
+  clearTimeout(state.outline.timer);
+  const tick = async () => {
+    const token = state.outline.token;
+    if (token === null) return;
+    try {
+      const job = await api(`/api/outline-checks/${token}`);
+      // 编辑已提交更新的核查：迟到的旧响应直接丢弃，绝不覆盖新结果
+      if (state.outline.token !== token) return;
+      if (job.status === "pending" || job.status === "running") {
+        state.outline.timer = setTimeout(tick, 600);
+        return;
+      }
+      renderOutlineResults(job);
+      state.outline.lastRendered = token;
+    } catch (err) {
+      showMsg($("#outline-msg"), err.message);
+    }
+  };
+  state.outline.timer = setTimeout(tick, 500);
+}
+
+async function submitOutlineCheck() {
+  const msg = $("#outline-msg");
+  let points;
+  try {
+    points = readOutlinePoints();
+  } catch (err) {
+    showMsg(msg, err.message);
+    return;
+  }
+  try {
+    $("#btn-outline-check").disabled = true;
+    const payload = {
+      points,
+      compute_delay_ms: parseInt($("#outline-delay").value, 10) || 0,
+    };
+    const data = await api("/api/outline-checks", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    });
+    const job = data.outline_job;
+    state.outline.token = job.check_id;  // 新核查令牌：旧令牌的响应之后一律忽略
+    state.outline.lastRendered = null;
+    // 同步输入行的标准值
+    state.outline.rows = points.map((p) => ({ text: p.text, threshold: p.threshold }));
+    renderOutlinePoints();
+    renderOutlineResults(job);
+    showMsg(msg, "核查已提交，后台正在比对文章句子", true);
+    scheduleOutlinePoll();
+  } catch (err) {
+    showMsg(msg, err.message);
+  } finally {
+    $("#btn-outline-check").disabled = false;
+  }
 }
 
 $("#btn-apply").addEventListener("click", applyCondition);
@@ -305,6 +527,16 @@ $("#btn-exclude").addEventListener("click", addExclusion);
 $("#btn-reset").addEventListener("click", resetDemo);
 $("#article-filter").addEventListener("input", renderArticleList);
 $("#dlg-close").addEventListener("click", () => $("#article-dialog").close());
+$("#btn-outline-add").addEventListener("click", addOutlinePoint);
+$("#btn-outline-check").addEventListener("click", submitOutlineCheck);
+
+// 初始 3 个提纲点（可增到 6 个、删到 3 个）
+state.outline.rows = [
+  { text: "", threshold: DEFAULT_THRESHOLD },
+  { text: "", threshold: DEFAULT_THRESHOLD },
+  { text: "", threshold: DEFAULT_THRESHOLD },
+];
+renderOutlinePoints();
 
 refresh().catch((err) => {
   $("#job-status").textContent = `加载失败：${err.message}`;

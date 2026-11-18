@@ -33,6 +33,16 @@ class ExclusionIn(BaseModel):
     article_id: int = Field(ge=1)
     compute_delay_ms: int = Field(default=0, ge=0, le=30000)
 
+
+class OutlinePointIn(BaseModel):
+    text: str = Field(description="提纲点短句")
+    threshold: float = Field(description="相似度下限，范围 0.05~0.95")
+
+
+class OutlineCheckIn(BaseModel):
+    points: list[OutlinePointIn] = Field(description="3~6 个提纲点")
+    compute_delay_ms: int = Field(default=0, ge=0, le=30000)
+
 def _validate_quotas(quotas: dict[str, int]) -> None:
     unknown = set(quotas) - set(TOPICS)
     if unknown:
@@ -53,6 +63,25 @@ def _validate_interest(interest: str) -> None:
         raise HTTPException(422, "兴趣短文过长（上限 2000 字）")
 
 
+def _validate_outline(body: OutlineCheckIn) -> list[dict]:
+    """校验提纲核查请求并返回标准化的 points 快照。"""
+    if not 3 <= len(body.points) <= 6:
+        raise HTTPException(422, "提纲点数量必须在 3~6 个之间")
+    points: list[dict] = []
+    for i, p in enumerate(body.points):
+        text = (p.text or "").strip()
+        if not text:
+            raise HTTPException(422, f"第 {i + 1} 个提纲点短句不能为空")
+        if len(text) > 500:
+            raise HTTPException(422, f"第 {i + 1} 个提纲点过长（上限 500 字）")
+        if not 0.05 <= p.threshold <= 0.95:
+            raise HTTPException(
+                422, f"第 {i + 1} 个提纲点的相似度下限必须在 0.05~0.95 之间"
+            )
+        points.append({"text": text, "threshold": float(p.threshold)})
+    return points
+
+
 def _article_brief(a: dict) -> dict:
     return {"id": a["id"], "title": a["title"], "topic": a["topic"], "author": a["author"]}
 
@@ -69,6 +98,7 @@ def _status_payload() -> dict:
         "plan": plan,
         "topics": TOPICS,
         "articles": [_article_brief(a) for a in ARTICLES],
+        "outline_job": database.get_latest_outline_job(),
     }
 
 
@@ -168,6 +198,26 @@ def reveal() -> dict:
     payload = _status_payload()
     payload["reveal_outcome"] = outcome
     return payload
+
+
+@app.post("/api/outline-checks")
+def create_outline_check(body: OutlineCheckIn) -> dict:
+    """提交一次提纲素材核查，开启新的核查编号并由后台异步计算。
+
+    每次提交都会使此前未完成的核查作废（stale），迟到结果无法覆盖新核查。
+    """
+    points = _validate_outline(body)
+    snapshot = {"points": points, "compute_delay_ms": body.compute_delay_ms}
+    database.create_outline_job(snapshot)
+    return _status_payload()
+
+
+@app.get("/api/outline-checks/{check_id}")
+def get_outline_check(check_id: int) -> dict:
+    job = database.get_outline_job(check_id)
+    if job is None:
+        raise HTTPException(404, "核查任务不存在")
+    return job
 
 
 @app.post("/api/reset")

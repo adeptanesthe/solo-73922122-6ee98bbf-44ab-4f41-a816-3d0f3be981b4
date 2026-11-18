@@ -93,3 +93,48 @@ dialog::backdrop { background: rgba(15,39,66,.45); }
 dialog article { padding: 22px; }
 .dlg-meta { font-size: 12px; color: #64748b; margin: 8px 0 14px; }
 #dlg-body { line-height: 1.8; font-size: 14px; white-space: pre-wrap; }
+
+/* ---------------- 提纲素材核查 ---------------- */
+.outline-panel { margin: 0 24px 24px; }
+.outline-panel .hint { font-size: 12px; color: #64748b; line-height: 1.7; margin: 0 0 14px; }
+.outline-points { display: flex; flex-direction: column; gap: 10px; }
+.outline-point {
+  display: grid; grid-template-columns: 28px 1fr 150px 34px; gap: 10px; align-items: start;
+  background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 8px; padding: 10px;
+}
+.outline-point .idx {
+  width: 24px; height: 24px; border-radius: 50%; background: #2563eb; color: #fff;
+  display: flex; align-items: center; justify-content: center; font-size: 12px;
+  font-weight: 600; margin-top: 6px;
+}
+.outline-point textarea { resize: vertical; min-height: 42px; }
+.outline-point .threshold-box { display: flex; flex-direction: column; gap: 4px; }
+.outline-point .threshold-box label { font-size: 11px; color: #64748b; }
+.outline-point .btn-remove {
+  border: none; background: #fee2e2; color: #991b1b; border-radius: 6px;
+  width: 30px; height: 30px; cursor: pointer; font-size: 16px; margin-top: 6px;
+}
+.outline-point .btn-remove:disabled { opacity: .4; cursor: not-allowed; }
+.delay-label { font-size: 12px; color: #64748b; margin-left: auto; align-self: center; }
+.delay-input { width: 110px; }
+.outline-results { display: grid; grid-template-columns: repeat(auto-fill, minmax(330px, 1fr)); gap: 12px; margin-top: 14px; }
+.outline-card { border: 1px solid #e2e8f0; border-radius: 8px; padding: 12px; background: #fff; }
+.outline-card.assigned { border-color: #16a34a; background: #f0fdf4; }
+.outline-card.unassigned { border-color: #f59e0b; background: #fffbeb; }
+.outline-card .oc-head { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+.outline-card .oc-point { font-size: 13px; font-weight: 600; color: #0f2742; line-height: 1.5; }
+.outline-card .oc-badge { font-size: 11px; padding: 2px 8px; border-radius: 999px; white-space: nowrap; }
+.oc-badge.ok { background: #bbf7d0; color: #166534; }
+.oc-badge.todo { background: #fed7aa; color: #9a3412; }
+.outline-card .oc-meta { font-size: 12px; color: #475569; margin: 8px 0 6px; display: flex; flex-wrap: wrap; gap: 4px; }
+.outline-card .oc-sentence {
+  font-size: 13px; line-height: 1.7; color: #1f2937; background: #fff;
+  border-left: 3px solid #2563eb; padding: 6px 10px; border-radius: 0 6px 6px 0;
+}
+.outline-card .oc-score { font-size: 12px; color: #2563eb; margin-top: 8px; }
+.outline-card .oc-hint { font-size: 12px; color: #92400e; margin-top: 8px; line-height: 1.6; }
+.outline-summary { font-size: 13px; color: #475569; margin-top: 12px; }
+@media (max-width: 760px) {
+  .outline-point { grid-template-columns: 24px 1fr; }
+  .outline-point .threshold-box, .outline-point .btn-remove { grid-column: 2; }
+}

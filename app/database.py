@@ -132,6 +132,19 @@ def init_db() -> None:
                     outcome_json TEXT NOT NULL,
                     expires_at REAL NOT NULL
                 );
+
+                -- 提纲素材核查的异步任务：每次提交一条，自增 check_id。
+                -- 写回时若已存在更大的 check_id，则判定为迟到结果并标记 stale，
+                -- 旧核查永远不能覆盖新核查。
+                CREATE TABLE IF NOT EXISTS outline_jobs (
+                    check_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    status TEXT NOT NULL,              -- pending/running/done/failed/stale
+                    request_snapshot_json TEXT NOT NULL,
+                    result_json TEXT,
+                    error TEXT,
+                    created_at TEXT NOT NULL,
+                    finished_at TEXT
+                );
                 """
             )
             # 轻量迁移：早期版本 reveal_claims.expires_at 为 TEXT，
@@ -422,6 +435,121 @@ def fail_job(generation: int, error: str) -> bool:
         return current_gen == generation
 
 
+# ---------------- 提纲核查任务（独立自增世代，迟到结果不覆盖新核查） ----------------
+
+
+def create_outline_job(snapshot: dict[str, Any]) -> dict[str, Any]:
+    """登记一条提纲核查任务，返回新任务（check_id 单调递增）。
+
+    登记新任务时，所有尚未结算的旧任务立即标记 stale，从源头拒绝迟到结果。
+    """
+    with _write_tx() as conn:
+        conn.execute(
+            "UPDATE outline_jobs SET status = 'stale', finished_at = ? "
+            "WHERE status IN ('pending', 'running')",
+            (_now(),),
+        )
+        cur = conn.execute(
+            "INSERT INTO outline_jobs(status, request_snapshot_json, created_at) "
+            "VALUES ('pending', ?, ?)",
+            (json.dumps(snapshot, ensure_ascii=False), _now()),
+        )
+        check_id = cur.lastrowid
+    return get_outline_job(check_id)  # type: ignore[return-value]
+
+
+def claim_pending_outline_job() -> dict[str, Any] | None:
+    """原子领取最早的一条 pending 提纲任务；没有则返回 None。"""
+    with _write_tx() as conn:
+        row = conn.execute(
+            "SELECT * FROM outline_jobs WHERE status = 'pending' "
+            "ORDER BY check_id ASC LIMIT 1"
+        ).fetchone()
+        if not row:
+            return None
+        check_id = row["check_id"]
+        conn.execute(
+            "UPDATE outline_jobs SET status = 'running' WHERE check_id = ?",
+            (check_id,),
+        )
+    return get_outline_job(check_id)
+
+
+def get_outline_job(check_id: int) -> dict[str, Any] | None:
+    with _read_tx() as conn:
+        row = conn.execute(
+            "SELECT * FROM outline_jobs WHERE check_id = ?", (check_id,)
+        ).fetchone()
+        return _outline_row_to_dict(row) if row else None
+
+
+def get_latest_outline_job() -> dict[str, Any] | None:
+    with _read_tx() as conn:
+        row = conn.execute(
+            "SELECT * FROM outline_jobs ORDER BY check_id DESC LIMIT 1"
+        ).fetchone()
+        return _outline_row_to_dict(row) if row else None
+
+
+def _outline_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "check_id": row["check_id"],
+        "status": row["status"],
+        "request_snapshot": json.loads(row["request_snapshot_json"]),
+        "result": json.loads(row["result_json"]) if row["result_json"] else None,
+        "error": row["error"],
+        "created_at": row["created_at"],
+        "finished_at": row["finished_at"],
+    }
+
+
+def complete_outline_job(check_id: int, result: dict[str, Any]) -> bool:
+    """写回提纲核查结果。若已有更新的核查则拒绝写回，返回 False。"""
+    with _write_tx() as conn:
+        row = conn.execute(
+            "SELECT * FROM outline_jobs WHERE check_id = ?", (check_id,)
+        ).fetchone()
+        if not row or row["status"] != "running":
+            return False
+        latest_id = conn.execute(
+            "SELECT MAX(check_id) FROM outline_jobs"
+        ).fetchone()[0]
+        if latest_id != check_id:
+            # 迟到的旧核查：编辑已提交新提纲，旧结果一律不得落库覆盖
+            conn.execute(
+                "UPDATE outline_jobs SET status = 'stale', finished_at = ? "
+                "WHERE check_id = ? AND status = 'running'",
+                (_now(), check_id),
+            )
+            return False
+        conn.execute(
+            "UPDATE outline_jobs SET status = 'done', result_json = ?, "
+            "finished_at = ? WHERE check_id = ?",
+            (json.dumps(result, ensure_ascii=False), _now(), check_id),
+        )
+        return True
+
+
+def fail_outline_job(check_id: int, error: str) -> bool:
+    """记录核查失败；已有更新核查时只标记 stale。"""
+    with _write_tx() as conn:
+        row = conn.execute(
+            "SELECT status FROM outline_jobs WHERE check_id = ?", (check_id,)
+        ).fetchone()
+        if not row or row["status"] != "running":
+            return False
+        latest_id = conn.execute(
+            "SELECT MAX(check_id) FROM outline_jobs"
+        ).fetchone()[0]
+        new_status = "failed" if latest_id == check_id else "stale"
+        conn.execute(
+            "UPDATE outline_jobs SET status = ?, error = ?, finished_at = ? "
+            "WHERE check_id = ?",
+            (new_status, error[:500], _now(), check_id),
+        )
+        return latest_id == check_id
+
+
 # ---------------- 揭示推进 ----------------
 
 
@@ -573,6 +701,7 @@ def reset_all(
         conn.execute("DELETE FROM exclusions")
         conn.execute("DELETE FROM jobs")
         conn.execute("DELETE FROM reveal_claims")
+        conn.execute("DELETE FROM outline_jobs")
         conn.execute(
             "UPDATE state SET interest = ?, quotas_json = ?, generation = 1, "
             "revealed_json = '[]', updated_at = ? WHERE id = 1",
